@@ -1,8 +1,17 @@
 use moka::sync::Cache;
 use reqwest::Client;
 use serde::Deserialize;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+pub struct TwitchEmoteParser {
+    cache: Cache<String, Arc<TwitchEmote>>,
+    channel_index: Mutex<HashMap<String, Vec<String>>>,
+    token: String,
+    client_id: String,
+    client: Client,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct EmoteResponse {
@@ -24,15 +33,11 @@ pub struct EmoteImages {
     pub url_4x: String,
 }
 
-pub struct TwitchEmoteParser {
-    cache: Cache<String, Arc<TwitchEmote>>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Emote {
-    id: u32,
-    start: u16,
-    end: u16,
+    pub id: u32,
+    pub start: u16,
+    pub end: u16,
 }
 
 impl TwitchEmoteParser {
@@ -58,16 +63,21 @@ impl TwitchEmoteParser {
             cache.insert(emote.name.clone(), Arc::new(emote));
         }
 
-        Ok(Self { cache })
+        Ok(Self {
+            cache,
+            channel_index: Mutex::new(HashMap::new()),
+            token: token.to_string(),
+            client_id: client_id.to_string(),
+            client,
+        })
     }
 
     pub fn get(&self, key: &str) -> Option<Arc<TwitchEmote>> {
-        self.cache.get(&key.to_owned())
+        self.cache.get(key)
     }
 
     pub fn populate_string(&self, input: &str) -> Vec<Emote> {
         let mut result = Vec::new();
-
         let mut start = 0;
 
         for word in input.split_whitespace() {
@@ -90,5 +100,42 @@ impl TwitchEmoteParser {
         }
 
         result
+    }
+
+    pub async fn add_channel(&self, channel_id: &str) -> Result<(), reqwest::Error> {
+        let response = self
+            .client
+            .get("https://api.twitch.tv/helix/chat/emotes")
+            .query(&[("broadcaster_id", channel_id)])
+            .header("Authorization", format!("Bearer {}", self.token))
+            .header("Client-ID", &self.client_id)
+            .send()
+            .await?
+            .error_for_status()?;
+
+        let parsed: EmoteResponse = response.json().await?;
+
+        let mut names = Vec::new();
+
+        for emote in parsed.data {
+            let name = emote.name.clone();
+            self.cache.insert(name.clone(), Arc::new(emote));
+            names.push(name);
+        }
+
+        self.channel_index
+            .lock()
+            .unwrap()
+            .insert(channel_id.to_string(), names);
+
+        Ok(())
+    }
+
+    pub fn remove_channel(&self, channel_id: &str) {
+        if let Some(names) = self.channel_index.lock().unwrap().remove(channel_id) {
+            for name in names {
+                self.cache.invalidate(&name);
+            }
+        }
     }
 }
